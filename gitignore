@@ -1,0 +1,16 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Icon (generated automatically)
+netmonitor.ico
+netmonitor_preview.png
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# OS
+Thumbs.db
+.DS_Store
