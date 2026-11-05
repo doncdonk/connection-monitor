@@ -10,6 +10,9 @@ import threading
 import time
 import socket
 import queue
+import json
+import os
+import sys
 from datetime import datetime
 from collections import OrderedDict
 
@@ -26,6 +29,13 @@ PRIVATE_PREFIXES = (
     "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
 )
 
+if getattr(sys, 'frozen', False):
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+WHITELIST_FILE = os.path.join(APP_DIR, 'isp_whitelist.json')
+
 def is_private(ip):
     return ip.startswith(PRIVATE_PREFIXES)
 
@@ -41,6 +51,30 @@ def fmt_elapsed(seconds):
         return f"{int(seconds//60)}m {int(seconds%60)}s"
     else:
         return f"{int(seconds//3600)}h {int((seconds%3600)//60)}m"
+
+# ===== ISP Whitelist =====
+def load_whitelist() -> list[str]:
+    try:
+        with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return [str(x) for x in data]
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return []
+
+def save_whitelist(wl: list[str]):
+    try:
+        with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(wl, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def isp_matches_whitelist(isp: str, wl: list[str]) -> bool:
+    if not isp:
+        return False
+    isp_lower = isp.lower()
+    return any(entry.lower() in isp_lower for entry in wl)
 
 # ===== GeoIP Cache =====
 class GeoCache:
@@ -183,8 +217,11 @@ class App(tk.Tk):
         self._f_proc    = tk.StringVar()
         self._f_ip      = tk.StringVar()
         self._f_cc      = tk.StringVar()
-        self._hide_priv = tk.BooleanVar(value=True)   # デフォルトON
+        self._hide_priv = tk.BooleanVar(value=True)
         self._do_risk   = tk.BooleanVar(value=True)
+        self._hide_wl   = tk.BooleanVar(value=True)
+
+        self._isp_whitelist: list[str] = load_whitelist()
 
         # iid -> open/closed state for groups
         self._group_open: dict[str, bool] = {}
@@ -249,6 +286,15 @@ class App(tk.Tk):
         chk("Hide Private",    self._hide_priv)
         chk("Risk Highlight",  self._do_risk,  "#f85149")
         chk("Group by Process",self._group_mode)
+        chk("Hide WL ISPs",    self._hide_wl,  "#e3b341")
+
+        tk.Button(bar, text="ISP Whitelist",
+                  bg="#21262d", fg="#e3b341",
+                  activebackground="#30363d", activeforeground="#e3b341",
+                  relief="flat", bd=0, padx=8, pady=2,
+                  font=("Consolas", 9),
+                  cursor="hand2",
+                  command=self._show_wl_dialog).pack(side="left", padx=(4, 0))
 
         self._badge = tk.Label(bar, text="0 conns", bg="#161b22", fg="#3fb950",
                                font=("Consolas", 10, "bold"))
@@ -283,6 +329,7 @@ class App(tk.Tk):
         self._tv.tag_configure("odd",     background="#111820", foreground="#c9d1d9")
 
         self._tv.bind("<ButtonRelease-1>", self._on_click)
+        self._tv.bind("<Button-3>",        self._on_right_click)
 
     # ---------- Statusbar ----------
     def _build_statusbar(self):
@@ -334,19 +381,24 @@ class App(tk.Tk):
 
     # ---------- Table render ----------
     def _refresh_table(self, *_):
-        fp   = self._f_proc.get().lower()
-        fi   = self._f_ip.get().lower()
-        fc   = self._f_cc.get().upper()
-        hide = self._hide_priv.get()
-        risk = self._do_risk.get()
-        grp  = self._group_mode.get()
+        fp      = self._f_proc.get().lower()
+        fi      = self._f_ip.get().lower()
+        fc      = self._f_cc.get().upper()
+        hide    = self._hide_priv.get()
+        risk    = self._do_risk.get()
+        grp     = self._group_mode.get()
+        hide_wl = self._hide_wl.get()
 
         filtered = []
+        wl_hidden = 0
         for r in self._rows:
             if hide and r["private"]:                              continue
             if fp and fp not in r["process"].lower():              continue
             if fi and fi not in r["remote_ip"].lower():            continue
             if fc and not r.get("countryCode","").startswith(fc):  continue
+            if hide_wl and isp_matches_whitelist(r.get("isp",""), self._isp_whitelist):
+                wl_hidden += 1
+                continue
             filtered.append(r)
 
         self._tv.delete(*self._tv.get_children())
@@ -357,8 +409,10 @@ class App(tk.Tk):
             self._render_flat(filtered, risk)
 
         self._badge.config(text=f"{len(filtered)} conns")
+
+        wl_part = f"  /  WL filtered: {wl_hidden}" if wl_hidden > 0 else ""
         self._status.set(
-            f"Connections: {len(filtered)}  /  "
+            f"Connections: {len(filtered)}{wl_part}  /  "
             f"Updated: {datetime.now().strftime('%H:%M:%S')}  /  "
             f"Interval: {REFRESH_INTERVAL}s"
         )
@@ -380,7 +434,6 @@ class App(tk.Tk):
                             tags=(self._row_tag(r, i, risk),))
 
     def _render_grouped(self, rows, risk):
-        # プロセスでグループ化
         groups: dict[str, list] = OrderedDict()
         for r in rows:
             groups.setdefault(r["process"], []).append(r)
@@ -389,7 +442,6 @@ class App(tk.Tk):
             gid = f"__grp__{proc}"
             is_open = self._group_open.get(gid, True)
 
-            # グループヘッダ行: Process列にプロセス名+件数、他は空
             header_vals = [""] * len(COLS)
             header_vals[0] = f"{'v' if is_open else '>'} {proc}  ({len(conns)})"
             self._tv.insert("", "end", iid=gid, values=tuple(header_vals),
@@ -397,7 +449,6 @@ class App(tk.Tk):
 
             if is_open:
                 for i, r in enumerate(conns):
-                    # Process列を空にして子行として表示
                     vals = list(self._row_vals(r))
                     vals[0] = f"    {r['process']}"
                     self._tv.insert("", "end", values=tuple(vals),
@@ -408,6 +459,155 @@ class App(tk.Tk):
         if iid and iid.startswith("__grp__"):
             self._group_open[iid] = not self._group_open.get(iid, True)
             self._refresh_table()
+
+    # ---------- Right-click context menu ----------
+    def _on_right_click(self, event):
+        iid = self._tv.identify_row(event.y)
+        if not iid or iid.startswith("__grp__"):
+            return
+
+        # 選択行のISPを取得
+        self._tv.selection_set(iid)
+        vals = self._tv.item(iid, "values")
+        # ISP列は最後（インデックス8）
+        isp_col_idx = next((i for i, c in enumerate(COLS) if c[1] == "isp"), None)
+        if isp_col_idx is None:
+            return
+        isp = vals[isp_col_idx].strip()
+        if not isp:
+            return
+
+        already = any(e.lower() in isp.lower() or isp.lower() in e.lower()
+                      for e in self._isp_whitelist)
+
+        menu = tk.Menu(self, tearoff=0, bg="#21262d", fg="#c9d1d9",
+                       activebackground="#1f6feb", activeforeground="#ffffff",
+                       relief="flat", bd=1)
+        if already:
+            menu.add_command(
+                label=f'Remove "{isp}" from Whitelist',
+                command=lambda: self._wl_remove_by_isp(isp)
+            )
+        else:
+            menu.add_command(
+                label=f'Add "{isp}" to Whitelist',
+                command=lambda: self._wl_add(isp)
+            )
+        menu.add_separator()
+        menu.add_command(label="Manage Whitelist...", command=self._show_wl_dialog)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _wl_add(self, isp: str):
+        if isp and isp not in self._isp_whitelist:
+            self._isp_whitelist.append(isp)
+            save_whitelist(self._isp_whitelist)
+            self._refresh_table()
+
+    def _wl_remove_by_isp(self, isp: str):
+        # 部分一致で登録されているエントリを削除
+        isp_lower = isp.lower()
+        self._isp_whitelist = [
+            e for e in self._isp_whitelist
+            if e.lower() not in isp_lower and isp_lower not in e.lower()
+        ]
+        save_whitelist(self._isp_whitelist)
+        self._refresh_table()
+
+    # ---------- Whitelist dialog ----------
+    def _show_wl_dialog(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("ISP Whitelist")
+        dlg.geometry("420x380")
+        dlg.configure(bg="#0d1117")
+        dlg.resizable(False, True)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="ISP Whitelist", bg="#0d1117", fg="#e3b341",
+                 font=("Consolas", 12, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
+        tk.Label(dlg, text="部分一致（大文字小文字無視）でフィルタします",
+                 bg="#0d1117", fg="#6e7681",
+                 font=("Consolas", 8)).pack(anchor="w", padx=16)
+
+        # リスト表示エリア
+        list_frame = tk.Frame(dlg, bg="#0d1117")
+        list_frame.pack(fill="both", expand=True, padx=16, pady=8)
+
+        lb = tk.Listbox(list_frame, bg="#161b22", fg="#c9d1d9",
+                        selectbackground="#1f6feb", selectforeground="#ffffff",
+                        relief="flat", bd=0, font=("Consolas", 10),
+                        activestyle="none")
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        lb.pack(fill="both", expand=True)
+
+        def refresh_lb():
+            lb.delete(0, "end")
+            for entry in self._isp_whitelist:
+                lb.insert("end", entry)
+
+        refresh_lb()
+
+        # 削除ボタン
+        def remove_selected():
+            sel = lb.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            self._isp_whitelist.pop(idx)
+            save_whitelist(self._isp_whitelist)
+            refresh_lb()
+            self._refresh_table()
+
+        # 追加エリア
+        add_frame = tk.Frame(dlg, bg="#0d1117")
+        add_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+        new_var = tk.StringVar()
+        tk.Entry(add_frame, textvariable=new_var,
+                 bg="#21262d", fg="#e6edf3",
+                 insertbackground="#58a6ff",
+                 relief="flat", bd=4,
+                 font=("Consolas", 10),
+                 width=28).pack(side="left", padx=(0, 6))
+
+        def add_entry():
+            val = new_var.get().strip()
+            if val and val not in self._isp_whitelist:
+                self._isp_whitelist.append(val)
+                save_whitelist(self._isp_whitelist)
+                refresh_lb()
+                self._refresh_table()
+                new_var.set("")
+
+        tk.Button(add_frame, text="Add",
+                  bg="#238636", fg="#ffffff",
+                  activebackground="#2ea043", activeforeground="#ffffff",
+                  relief="flat", bd=0, padx=10, pady=3,
+                  font=("Consolas", 9), cursor="hand2",
+                  command=add_entry).pack(side="left")
+
+        # ボタンエリア
+        btn_frame = tk.Frame(dlg, bg="#0d1117")
+        btn_frame.pack(fill="x", padx=16, pady=(0, 12))
+
+        tk.Button(btn_frame, text="Remove Selected",
+                  bg="#b62324", fg="#ffffff",
+                  activebackground="#d1282a", activeforeground="#ffffff",
+                  relief="flat", bd=0, padx=10, pady=3,
+                  font=("Consolas", 9), cursor="hand2",
+                  command=remove_selected).pack(side="left")
+
+        tk.Button(btn_frame, text="Close",
+                  bg="#21262d", fg="#c9d1d9",
+                  activebackground="#30363d", activeforeground="#ffffff",
+                  relief="flat", bd=0, padx=10, pady=3,
+                  font=("Consolas", 9), cursor="hand2",
+                  command=dlg.destroy).pack(side="right")
 
     # ---------- Sort ----------
     def _sort_by(self, col_label):
@@ -426,9 +626,7 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     app = App()
-    # ウィンドウアイコン設定（タイトルバー＋タスクバー）
     import os, sys
-    # EXE化時は実行ファイルと同じディレクトリ、スクリプト実行時はカレントを探す
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     ico_path = os.path.join(base, 'netmonitor.ico')
     if os.path.exists(ico_path):
